@@ -10,10 +10,8 @@ from joblib import Parallel, delayed
 
 
 class Icom:
-    c: list = None        # Colour-labels
-    cams = None
-    d_mat: np.ndarray = None
-    d_unflat = None
+    c: list = None            # Colour-labels
+    d_mat: np.ndarray = None  # 2D matrix of differences between scan positions
 
     def __init__(self, directory: str, filename: str, bps: np.ndarray = None) -> Icom:
         '''
@@ -32,6 +30,8 @@ class Icom:
         self.bparray = bps if bps is not None else self._analyse_file(filename)
         self._get_shape()
         self.set_scan_range(0)
+
+    # ------------------|| Helper and preprocessing methods ||-----------------
 
     def _analyse_file(self, filename):
         '''Reads data from a .hdf5 and outputs an array of bragg points'''
@@ -94,8 +94,8 @@ class Icom:
 
         self.scan_bps = scan_bps
 
-    def points_by_cluster(self):
-        np.unique(self.c)
+    # def points_by_cluster(self):
+    #     np.unique(self.c)
 
     # ------------------|| Methods for Brute Force approach ||-----------------
 
@@ -175,10 +175,12 @@ class Icom:
         pattern_distance = distances_min.sum(axis=1)
         return pattern_distance
 
-    def calc_dist_matrix(self, n: int = 5, n_jobs: int = -1) -> np.ndarray:
+    def calc_dist_matrix_brute(self, n: int = 5, n_jobs: int = -1) -> np.ndarray:
         '''
         Computes the similarity of scan-positions by the sum of the
-        distances between the n-closest peaks but pArAlLeLiSeD
+        distances between the n-closest peaks. Each job compares a subset of
+        scan-positions to every scan position.
+
         Parameters
         ----------
 
@@ -190,15 +192,13 @@ class Icom:
             parallelism, running computations simultaneaously and
             significantly reducing run time.
 
-            Leave blank/set to -1 to utilise all logical processors.
+            Leave blank/set to -1 to utilise all logical processors*2.
         '''
         if n_jobs == -1:
-            n_jobs = os.cpu_count()
+            n_jobs = 2*os.cpu_count()
 
         R_shape = self._get_scan_shape()
-
         to_compare = self._peaks_to_compare(n, R_shape)
-
         size = to_compare.shape[0]
         d_mat = np.empty(shape=(size, size))
 
@@ -211,52 +211,35 @@ class Icom:
                     d_chunk.append((ind, arrayline))
             return d_chunk
 
+        # Construct lists of indices each job should work on
         indices = np.array_split(np.arange(R_shape[0]), n_jobs)
 
+        # Runs each job with each job's parameters and returns
+        # a list from each job
         results = Parallel(n_jobs)(
             delayed(calc_chunk)(indices[i]) for i in range(n_jobs)
         )
 
+        # Combine output from each job
         for result in results:
             for output in result:
                 d_mat[output[0], :] = output[1]
 
         self.d_mat = d_mat
-
         return d_mat
 
     # ____________________¦¦ End of Brute Force approach ¦¦____________________
-    def save_brute_d(self, file_name: str = 'd_mat.py'):
-        assert self.d_mat is not None, 'd_mat not computed'
-        np.save(file_name, self.d_mat)
-
-    def save_brute_c(self, file_name: str = 'c_labels.py'):
-        assert self.c is not None, 'c not computed'
-        np.save(file_name, self.c)
-
-    def load_brute_d(self, file_name='d_mat.py') -> np.ndarray:
-        self.d_mat = np.load(file_name)
-        return self.d_mat
-
-    def load_brute_c(self, file_name='c_labels.py') -> np.ndarray:
-        self.c = np.load(file_name)
-        return self.c
-
     def cluster_brute_force(self, hdb_cluster=None, n_jobs=-1):
+        '''
+        '''
         if not hdb_cluster:
             hdb_cluster = fast_hdbscan.HDBSCAN(
                 min_cluster_size=100,
                 n_jobs=n_jobs,
                 cluster_selection_epsilon=.1,
             )
-        try:
-            hdb_cluster.fit(self.d_mat)
-        except AttributeError:
-            print("Using wrong HDB library")
-
+        hdb_cluster.fit(self.d_mat)
         self.c = hdb_cluster.labels_
-
-        return self.c
 
     def generate_random_colormap(self, grid):
         seed = sum(ord(char) for char in 'SusAmogus')
@@ -306,7 +289,7 @@ class Icom:
         return peaks
 
     # TODO: See if for loops necessary
-    def _peaks_to_compare_pca(self, n: int, R_shape: tuple, Rs_to_compare) -> np.ndarray:
+    def _peaks_to_compare_pca(self, n: int, R_shape: tuple, Rs_to_compare: list) -> np.ndarray:
         '''
         Returns an array of the n brightest diffraction spots for each
         Rx, Ry position as a flattened 1D array.
@@ -327,9 +310,26 @@ class Icom:
 
         return matrix
 
-    def calc_dist_pca(self, n=5, Rs_to_compare=[[0, 0]], n_jobs=-1):
+    def calc_dist_pca(self, n=5, n_jobs=-1, cams=[[0, 0]],):
         '''
-        stuff
+        Computes the similarity of scan-positions by the sum of the
+        distances between the n-closest peaks. Each job compares a subset of
+        scan-positions to every scan position.
+
+        Parameters
+        ----------
+
+        n:
+            Number of peaks to compare. Significantly increases runtime
+            as n increases. Recommended value ~5.
+        n_jobs:
+            Number of threads/jobs to split the data into. This introduces
+            parallelism, running computations simultaneaously and
+            significantly reducing run time.
+
+            Leave blank/set to -1 to utilise all logical processors*2.
+        cams:
+            List of [Rx, Ry] points to compare to every point.
         '''
         if n_jobs == -1:
             n_jobs = os.cpu_count()
@@ -337,8 +337,8 @@ class Icom:
         rows, cols = self.scan_rows, self.scan_cols
         R_shape = (rows, cols)
 
-        to_compare = self._peaks_to_compare_pca(n, R_shape, Rs_to_compare)
-        d_mat = np.zeros(shape=(rows*cols, len(Rs_to_compare)+2))
+        to_compare = self._peaks_to_compare_pca(n, R_shape, cams)
+        d_mat = np.zeros(shape=(rows*cols, len(cams)+2))
 
         def calc_chunk(indices):
             d_chunk = []
@@ -429,4 +429,20 @@ class Icom:
             plt.scatter(filtered_matrix[:, -1]*cols, filtered_matrix[::-1, -2]*cols, marker='s', s=5)
             plt.title(f"cluster {c}")
             plt.show()
-        # filtered_c = self.c[self.c != -1]
+
+    # -----------------------|| Saving/Loading methods ||----------------------
+    def save_d(self, file_name: str = 'd_mat.py'):
+        assert self.d_mat is not None, 'd_mat not computed'
+        np.save(file_name, self.d_mat)
+
+    def save_c(self, file_name: str = 'c_labels.py'):
+        assert self.c is not None, 'c not computed'
+        np.save(file_name, self.c)
+
+    def load_d(self, file_name='d_mat.py') -> np.ndarray:
+        self.d_mat = np.load(file_name)
+        return self.d_mat
+
+    def load_c(self, file_name='c_labels.py') -> np.ndarray:
+        self.c = np.load(file_name)
+        return self.c
